@@ -35,7 +35,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
     match args.cmd {
-        Cmd::Run { tasks, foreground } => run_cmd(start, tasks, foreground),
+        Cmd::Run {
+            tasks,
+            foreground,
+            no_prebuild,
+        } => run_cmd(start, tasks, foreground, no_prebuild),
         Cmd::Status { json } => status_cmd(start, json),
         Cmd::Stop => stop_cmd(start),
         Cmd::Proc { name, op } => proc_cmd(start, name, op),
@@ -45,7 +49,11 @@ fn main() -> Result<()> {
             before,
             json,
         } => grep_cmd(start, pattern, before, after, json),
-        Cmd::DaemonInner { tasks, root } => daemon_inner(root, tasks),
+        Cmd::DaemonInner {
+            tasks,
+            root,
+            no_prebuild,
+        } => daemon_inner(root, tasks, no_prebuild),
     }
 }
 
@@ -65,7 +73,7 @@ fn resolve_root(start: PathBuf) -> Result<PathBuf> {
     }
 }
 
-fn run_cmd(start: PathBuf, tasks: Vec<String>, foreground: bool) -> Result<()> {
+fn run_cmd(start: PathBuf, tasks: Vec<String>, foreground: bool, no_prebuild: bool) -> Result<()> {
     let root = resolve_root(start.clone())?;
     let state_dir = daemon::state_dir(&root);
     std::fs::create_dir_all(&state_dir)?;
@@ -82,16 +90,17 @@ fn run_cmd(start: PathBuf, tasks: Vec<String>, foreground: bool) -> Result<()> {
     }
 
     if foreground {
-        return daemon_inner(root, tasks);
+        return daemon_inner(root, tasks, no_prebuild);
     }
 
     // Fork-style detach via re-exec.
     let self_exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = std::process::Command::new(&self_exe);
-    cmd.arg("daemon-inner")
-        .arg("--root")
-        .arg(&root)
-        .args(&tasks);
+    cmd.arg("daemon-inner").arg("--root").arg(&root);
+    if no_prebuild {
+        cmd.arg("--no-prebuild");
+    }
+    cmd.args(&tasks);
     // Detach: new session, redirect stdio to /dev/null.
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
@@ -118,7 +127,7 @@ fn run_cmd(start: PathBuf, tasks: Vec<String>, foreground: bool) -> Result<()> {
     Ok(())
 }
 
-fn daemon_inner(root: PathBuf, tasks: Vec<String>) -> Result<()> {
+fn daemon_inner(root: PathBuf, tasks: Vec<String>, no_prebuild: bool) -> Result<()> {
     let state_dir = daemon::state_dir(&root);
     std::fs::create_dir_all(&state_dir)?;
     let lock_path = state_dir.join("lock");
@@ -128,7 +137,7 @@ fn daemon_inner(root: PathBuf, tasks: Vec<String>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(daemon::Daemon::run(ws, tasks, state_dir))
+    rt.block_on(daemon::Daemon::run(ws, tasks, state_dir, no_prebuild))
 }
 
 fn status_cmd(start: PathBuf, json: bool) -> Result<()> {

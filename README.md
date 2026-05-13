@@ -66,6 +66,7 @@ procpane stop
 - **Process groups** (`setpgid`) so `kill(-pgid, SIGINT)` reaps `next dev`'s workers cleanly.
 - **DAG via `petgraph`**: `dependsOn`, `^`-topological deps, and `pkg#task` explicit deps are honored. `with:` siblings launch alongside without a graph edge.
 - **In-memory only**: no logs on disk. Stopping the daemon discards the buffers. Persistence is the agent's job (pipe `tail --json` to a file).
+- **Build phase delegated to turbo.** Non-persistent dependencies (e.g. `^build` chains) run as a single `<pm> exec turbo run …` step before any persistent task spawns. You get turbo's cache for free — warm-cache dev boot is sub-second. The combined output lands in a `procpane#prebuild` buffer; if turbo exits non-zero, the run aborts. Pass `--no-prebuild` to skip this and manage builds yourself.
 
 ## Compatibility
 

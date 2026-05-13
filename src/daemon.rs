@@ -14,6 +14,8 @@ use crate::process::{Proc, ProcState};
 use crate::proto::{GrepMatch, LineRecord, ProcStatus, Request, Response};
 use crate::workspace::Workspace;
 
+pub const PREBUILD_ID: &str = "procpane#prebuild";
+
 pub struct Daemon {
     pub state_dir: PathBuf,
     pub socket_path: PathBuf,
@@ -24,7 +26,12 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub async fn run(ws: Workspace, requested: Vec<String>, state_dir: PathBuf) -> Result<()> {
+    pub async fn run(
+        ws: Workspace,
+        requested: Vec<String>,
+        state_dir: PathBuf,
+        no_prebuild: bool,
+    ) -> Result<()> {
         std::fs::create_dir_all(&state_dir)?;
         let socket_path = state_dir.join("sock");
         // Remove stale socket if present.
@@ -35,18 +42,42 @@ impl Daemon {
             return Err(anyhow!("no tasks resolved"));
         }
 
-        // Build proc registry — one Proc per node.
+        // Partition graph nodes: persistent (procpane runs) vs non-persistent (turbo prebuild).
+        let mut prebuild_ids: Vec<String> = Vec::new();
+        let mut persistent_indices: Vec<NodeIndex> = Vec::new();
+        for idx in graph.graph.node_indices() {
+            let n = &graph.graph[idx];
+            if n.def.persistent {
+                persistent_indices.push(idx);
+            } else if n.script.is_some() {
+                prebuild_ids.push(n.id());
+            }
+        }
+        if persistent_indices.is_empty() {
+            return Err(anyhow!(
+                "no persistent tasks to run; for non-persistent tasks use `turbo run` directly"
+            ));
+        }
+
+        // One Proc per persistent node, plus optional turbo-prebuild proc.
         let mut procs: BTreeMap<String, Arc<Proc>> = BTreeMap::new();
         let mut buffers: BTreeMap<String, SharedBuffer> = BTreeMap::new();
         let mut node_to_id: BTreeMap<NodeIndex, String> = BTreeMap::new();
-        for idx in graph.graph.node_indices() {
-            let n = &graph.graph[idx];
+        for idx in &persistent_indices {
+            let n = &graph.graph[*idx];
             let id = n.id();
             let buf = buffer::new_shared(buffer::DEFAULT_CAPACITY);
             let proc = Proc::new(id.clone(), buf.clone(), n.def.persistent);
             buffers.insert(id.clone(), buf);
             procs.insert(id.clone(), proc);
-            node_to_id.insert(idx, id);
+            node_to_id.insert(*idx, id);
+        }
+        let do_prebuild = !no_prebuild && !prebuild_ids.is_empty();
+        if do_prebuild {
+            let buf = buffer::new_shared(buffer::DEFAULT_CAPACITY);
+            let proc = Proc::new(PREBUILD_ID.to_string(), buf.clone(), false);
+            buffers.insert(PREBUILD_ID.to_string(), buf);
+            procs.insert(PREBUILD_ID.to_string(), proc);
         }
 
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -72,8 +103,21 @@ impl Daemon {
         let sched_daemon = Arc::clone(&daemon);
         let graph_arc = Arc::new(graph);
         let mut sched_stop = stop_rx.clone();
+        let pm = ws.pkg_manager.clone();
+        let root = ws.root.clone();
+        let persistent_set: HashSet<NodeIndex> = persistent_indices.into_iter().collect();
         let scheduler = tokio::spawn(async move {
-            run_scheduler(sched_daemon, graph_arc, &mut sched_stop).await;
+            run_scheduler(
+                sched_daemon,
+                graph_arc,
+                persistent_set,
+                do_prebuild,
+                prebuild_ids,
+                pm,
+                root,
+                &mut sched_stop,
+            )
+            .await;
         });
 
         // Listen on Unix socket.
@@ -126,10 +170,63 @@ impl Daemon {
 async fn run_scheduler(
     daemon: Arc<Daemon>,
     graph: Arc<TaskGraph>,
+    persistent_set: HashSet<NodeIndex>,
+    do_prebuild: bool,
+    prebuild_ids: Vec<String>,
+    pkg_manager: String,
+    root: std::path::PathBuf,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let mut completed: HashSet<NodeIndex> = HashSet::new();
     let mut spawned: HashSet<NodeIndex> = HashSet::new();
+
+    // Pre-mark non-persistent nodes as completed; turbo prebuild handles them (or user opted out).
+    for idx in graph.graph.node_indices() {
+        if !persistent_set.contains(&idx) {
+            completed.insert(idx);
+            spawned.insert(idx);
+        }
+    }
+
+    // Turbo prebuild phase.
+    if do_prebuild {
+        if let Some(proc) = daemon.procs.get(PREBUILD_ID).cloned() {
+            let mut shell = format!("{pkg_manager} exec turbo run");
+            for id in &prebuild_ids {
+                shell.push(' ');
+                shell.push_str(id);
+            }
+            let env: Vec<(String, String)> = Vec::new();
+            if let Err(e) = proc.spawn(&shell, &root, &env) {
+                tracing::error!(?e, "prebuild spawn failed");
+                *proc.state.lock() = ProcState::Crashed;
+                if let Some(tx) = daemon.stop_tx.lock().as_ref() {
+                    let _ = tx.send(true);
+                }
+                return;
+            }
+            loop {
+                if *stop_rx.borrow() {
+                    return;
+                }
+                let st = *proc.state.lock();
+                if matches!(st, ProcState::Exited | ProcState::Crashed | ProcState::Killed) {
+                    if matches!(st, ProcState::Crashed | ProcState::Killed) {
+                        eprintln!("procpane: turbo prebuild failed; aborting run");
+                        if let Some(tx) = daemon.stop_tx.lock().as_ref() {
+                            let _ = tx.send(true);
+                        }
+                        return;
+                    }
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    _ = stop_rx.changed() => { if *stop_rx.borrow() { return; } }
+                }
+            }
+        }
+    }
 
     loop {
         if *stop_rx.borrow() {

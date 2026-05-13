@@ -21,6 +21,8 @@ pub struct Workspace {
     pub root: PathBuf,
     pub turbo: TurboJson,
     pub packages: Vec<Package>,
+    /// Detected package manager command: "pnpm" | "npm" | "yarn" | "bun"
+    pub pkg_manager: String,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +75,7 @@ impl Workspace {
         let turbo = TurboJson::load(&turbo_path)?;
 
         let patterns = discover_workspace_patterns(&root)?;
+        let pkg_manager = detect_package_manager(&root);
         let mut packages = Vec::new();
 
         // Root package is its own "package" for root-level tasks.
@@ -122,6 +125,7 @@ impl Workspace {
             root,
             turbo,
             packages,
+            pkg_manager,
         })
     }
 
@@ -144,6 +148,27 @@ fn find_root(start: &Path) -> Result<PathBuf> {
             None => return Err(anyhow!("no turbo.json found from {}", start.display())),
         }
     }
+}
+
+fn detect_package_manager(root: &Path) -> String {
+    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(pj) = serde_json::from_str::<RootPackageJson>(&text) {
+            if let Some(pm) = pj.package_manager.as_deref() {
+                let name = pm.split_once('@').map(|(n, _)| n).unwrap_or(pm);
+                return name.to_string();
+            }
+        }
+    }
+    if root.join("pnpm-lock.yaml").is_file() {
+        return "pnpm".into();
+    }
+    if root.join("yarn.lock").is_file() {
+        return "yarn".into();
+    }
+    if root.join("bun.lockb").is_file() || root.join("bun.lock").is_file() {
+        return "bun".into();
+    }
+    "npm".into()
 }
 
 fn discover_workspace_patterns(root: &Path) -> Result<Vec<String>> {

@@ -21,6 +21,9 @@ pub enum Cmd {
         /// Run in the foreground (do not detach)
         #[arg(long)]
         foreground: bool,
+        /// Skip the `turbo run` prebuild step for non-persistent deps
+        #[arg(long)]
+        no_prebuild: bool,
     },
     /// List running processes
     Status {
@@ -52,6 +55,8 @@ pub enum Cmd {
         tasks: Vec<String>,
         #[arg(long)]
         root: std::path::PathBuf,
+        #[arg(long)]
+        no_prebuild: bool,
     },
 }
 
