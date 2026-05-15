@@ -3,6 +3,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::BTreeMap;
 
 use crate::config::{parse_dep, DepRef, TaskDef, TurboJson};
+use crate::sidecar::TaskOverlay;
 use crate::workspace::Workspace;
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,8 @@ pub struct TaskNode {
     pub cwd: std::path::PathBuf,
     /// Sibling co-launches (`with`): launch alongside, no edge in DAG.
     pub with: Vec<String>, // resolved "pkg#task" ids
+    /// procpane.toml overlay (healthcheck, hostname, etc.). Empty when absent.
+    pub overlay: TaskOverlay,
 }
 
 impl TaskNode {
@@ -135,6 +138,14 @@ impl TaskGraph {
                 pending.push(x);
             }
 
+            let canonical_id = format!("{}#{}", package.name, task);
+            let short_overlay_id = format!("{}#{}", package.short, task);
+            let overlay = ws
+                .sidecar
+                .overlay(&canonical_id, Some(&short_overlay_id))
+                .cloned()
+                .unwrap_or_default();
+
             let node = TaskNode {
                 package: pkg.clone(),
                 task: task.clone(),
@@ -142,6 +153,7 @@ impl TaskGraph {
                 script,
                 cwd: package.path.clone(),
                 with: with_ids,
+                overlay,
             };
             let idx = graph.add_node(node);
             by_id.insert(id.clone(), idx);

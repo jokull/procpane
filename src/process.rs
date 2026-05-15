@@ -8,12 +8,47 @@ use std::time::{Duration, Instant};
 
 use crate::buffer::SharedBuffer;
 
+/// Env vars carried over from procpane's parent shell even when the task has
+/// opted into `env_from` (and therefore wants a scrubbed env). These are the
+/// vars a Unix process generally expects to find — locale, terminal, user
+/// identity, temp directory. *No* third-party-credentials-shaped names.
+const SAFE_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_TIME",
+    "LC_NUMERIC",
+    "LC_MONETARY",
+    "TZ",
+    "TMPDIR",
+    "COLORTERM",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "PAGER",
+    "EDITOR",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcState {
+    /// Waiting on dependencies; not yet spawned.
     Pending,
-    Running,
-    Exited,
+    /// Spawned, process running, healthcheck not yet satisfied.
+    /// (For tasks with no healthcheck, transitions to `Healthy` immediately.)
+    Starting,
+    /// Process running and healthcheck has passed (persistent tasks).
+    Healthy,
+    /// One-shot task ran to completion successfully (exit 0).
+    Completed,
+    /// Process exited with non-zero status, unexpectedly.
     Crashed,
+    /// Killed by us (SIGINT/SIGTERM/SIGKILL).
     Killed,
 }
 
@@ -21,11 +56,19 @@ impl ProcState {
     pub fn as_str(&self) -> &'static str {
         match self {
             ProcState::Pending => "pending",
-            ProcState::Running => "running",
-            ProcState::Exited => "exited",
+            ProcState::Starting => "starting",
+            ProcState::Healthy => "healthy",
+            ProcState::Completed => "completed",
             ProcState::Crashed => "crashed",
             ProcState::Killed => "killed",
         }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ProcState::Completed | ProcState::Crashed | ProcState::Killed
+        )
     }
 }
 
@@ -60,7 +103,21 @@ impl Proc {
 
     /// Spawn under a PTY, in its own process group. Returns once the child is
     /// spawned; reader thread streams into the ring buffer.
-    pub fn spawn(self: &Arc<Self>, shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<()> {
+    ///
+    /// `inherit_parent_env` controls whether the spawned process sees procpane's
+    /// full parent environment. When `false`, only a minimal "safe" set
+    /// (HOME, USER, LANG, etc.) is inherited and everything else is dropped —
+    /// the caller's overlay (`env`) is the only source of project-specific
+    /// values. This is the right mode for tasks that have declared an
+    /// `env_from` allowlist; it makes the allowlist actually load-bearing
+    /// instead of "allowlist on top of full bleed".
+    pub fn spawn(
+        self: &Arc<Self>,
+        shell_cmd: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        inherit_parent_env: bool,
+    ) -> Result<()> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -77,9 +134,21 @@ impl Proc {
         cmd.arg(shell_cmd);
         cmd.cwd(cwd);
 
-        // Inherit env, then overlay.
-        for (k, v) in std::env::vars() {
-            cmd.env(k, v);
+        if inherit_parent_env {
+            for (k, v) in std::env::vars() {
+                cmd.env(k, v);
+            }
+        } else {
+            // Wipe the auto-inherited parent env first, then only add the
+            // minimal "safe" set. Without env_clear(), portable-pty merges
+            // our additions on top of the full parent env — so the allowlist
+            // would be a no-op.
+            cmd.env_clear();
+            for k in SAFE_ENV_KEYS {
+                if let Ok(v) = std::env::var(k) {
+                    cmd.env(k, v);
+                }
+            }
         }
         // Tell programs we are a terminal.
         cmd.env("TERM", "xterm-256color");
@@ -93,7 +162,7 @@ impl Proc {
         let killer = child.clone_killer();
 
         *self.pid.lock() = pid;
-        *self.state.lock() = ProcState::Running;
+        *self.state.lock() = ProcState::Starting;
         *self.started_at.lock() = Some(Instant::now());
         *self.killer.lock() = Some(killer);
         // Store child + master BEFORE spawning the reader thread to avoid a
@@ -129,7 +198,7 @@ impl Proc {
                     let mut st = proc_clone.state.lock();
                     if *st != ProcState::Killed {
                         *st = if code == 0 {
-                            ProcState::Exited
+                            ProcState::Completed
                         } else {
                             ProcState::Crashed
                         };
@@ -143,19 +212,19 @@ impl Proc {
         Ok(())
     }
 
-    pub fn stop(&self, grace: Duration) {
+    pub fn stop_with_signal(&self, signal: i32, grace: Duration) {
         {
             let mut st = self.state.lock();
-            if matches!(*st, ProcState::Exited | ProcState::Crashed | ProcState::Killed) {
+            if st.is_terminal() {
                 return;
             }
             *st = ProcState::Killed;
         }
         let pid = *self.pid.lock();
         if let Some(pid) = pid {
-            // SIGINT to the process group.
+            // Send to the process group so descendants get reaped.
             unsafe {
-                libc::kill(-pid, libc::SIGINT);
+                libc::kill(-pid, signal);
             }
         }
         let deadline = Instant::now() + grace;
