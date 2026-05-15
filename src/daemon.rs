@@ -10,8 +10,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::buffer::{self, SharedBuffer};
 use crate::graph::TaskGraph;
+use crate::healthcheck::{run_healthcheck_loop, HealthcheckKind};
 use crate::process::{Proc, ProcState};
 use crate::proto::{GrepMatch, LineRecord, ProcStatus, Request, Response};
+use crate::sidecar::DependsOnCondition;
 use crate::workspace::Workspace;
 
 pub const PREBUILD_ID: &str = "procpane#prebuild";
@@ -23,6 +25,12 @@ pub struct Daemon {
     pub buffers: BTreeMap<String, SharedBuffer>,
     pub stop_tx: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     pub started_at: Instant,
+    /// Per-task hostname declared in `procpane.toml` (for status output).
+    pub hostnames: BTreeMap<String, String>,
+    /// Per-task shutdown signal (libc::SIG*). Default SIGINT.
+    pub stop_signals: BTreeMap<String, i32>,
+    /// Per-task grace period before SIGKILL. Default 5s.
+    pub stop_grace: BTreeMap<String, Duration>,
 }
 
 impl Daemon {
@@ -80,6 +88,20 @@ impl Daemon {
             procs.insert(PREBUILD_ID.to_string(), proc);
         }
 
+        // Collect per-task overlay-derived metadata for daemon-side use.
+        let mut hostnames: BTreeMap<String, String> = BTreeMap::new();
+        let mut stop_signals: BTreeMap<String, i32> = BTreeMap::new();
+        let mut stop_grace: BTreeMap<String, Duration> = BTreeMap::new();
+        for idx in &persistent_indices {
+            let n = &graph.graph[*idx];
+            let id = n.id();
+            if let Some(h) = &n.overlay.hostname {
+                hostnames.insert(id.clone(), h.clone());
+            }
+            stop_signals.insert(id.clone(), n.overlay.stop_signal());
+            stop_grace.insert(id, n.overlay.stop_grace());
+        }
+
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let daemon = Arc::new(Daemon {
             state_dir: state_dir.clone(),
@@ -88,6 +110,9 @@ impl Daemon {
             buffers: buffers.clone(),
             stop_tx: Arc::new(Mutex::new(Some(stop_tx.clone()))),
             started_at: Instant::now(),
+            hostnames,
+            stop_signals,
+            stop_grace,
         });
 
         // Install signal handler so Ctrl-C or SIGTERM triggers shutdown.
@@ -106,6 +131,7 @@ impl Daemon {
         let pm = ws.pkg_manager.clone();
         let root = ws.root.clone();
         let persistent_set: HashSet<NodeIndex> = persistent_indices.into_iter().collect();
+        let sched_stop_rx = stop_rx.clone();
         let scheduler = tokio::spawn(async move {
             run_scheduler(
                 sched_daemon,
@@ -116,6 +142,7 @@ impl Daemon {
                 pm,
                 root,
                 &mut sched_stop,
+                sched_stop_rx,
             )
             .await;
         });
@@ -156,10 +183,20 @@ impl Daemon {
             }
         }
 
-        // Shutdown all procs.
+        // Shutdown all procs, honoring per-task stop signal & grace.
         eprintln!("procpane shutting down…");
-        for (_, p) in &daemon.procs {
-            p.stop(Duration::from_secs(5));
+        for (id, p) in &daemon.procs {
+            let signal = daemon
+                .stop_signals
+                .get(id)
+                .copied()
+                .unwrap_or(libc::SIGINT);
+            let grace = daemon
+                .stop_grace
+                .get(id)
+                .copied()
+                .unwrap_or(Duration::from_secs(5));
+            p.stop_with_signal(signal, grace);
         }
         scheduler.abort();
         let _ = std::fs::remove_file(&socket_path);
@@ -176,15 +213,46 @@ async fn run_scheduler(
     pkg_manager: String,
     root: std::path::PathBuf,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    health_stop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut completed: HashSet<NodeIndex> = HashSet::new();
     let mut spawned: HashSet<NodeIndex> = HashSet::new();
 
-    // Pre-mark non-persistent nodes as completed; turbo prebuild handles them (or user opted out).
-    for idx in graph.graph.node_indices() {
-        if !persistent_set.contains(&idx) {
-            completed.insert(idx);
-            spawned.insert(idx);
+    // Default depends_on condition for an edge: a persistent dep must be
+    // `healthy`; a non-persistent dep must be `completed`.
+    let default_condition = |dep_idx: NodeIndex| -> DependsOnCondition {
+        let dep_node = &graph.graph[dep_idx];
+        if dep_node.def.persistent {
+            DependsOnCondition::Healthy
+        } else {
+            DependsOnCondition::Completed
+        }
+    };
+
+    // Does this graph edge consider `dep_idx`'s current state satisfactory?
+    let edge_satisfied = |dep_idx: NodeIndex, condition: DependsOnCondition| -> bool {
+        let dep_id = graph.graph[dep_idx].id();
+        let st = daemon
+            .procs
+            .get(&dep_id)
+            .map(|p| *p.state.lock())
+            .unwrap_or(ProcState::Pending);
+        match condition {
+            DependsOnCondition::Started => {
+                // Anything beyond Pending.
+                !matches!(st, ProcState::Pending)
+            }
+            DependsOnCondition::Healthy => matches!(st, ProcState::Healthy | ProcState::Completed),
+            DependsOnCondition::Completed => matches!(st, ProcState::Completed),
+        }
+    };
+
+    // Pre-mark non-persistent nodes as spawned when prebuild owns them; turbo
+    // prebuild satisfies their downstream effects in one shot.
+    if do_prebuild {
+        for idx in graph.graph.node_indices() {
+            if !persistent_set.contains(&idx) {
+                spawned.insert(idx);
+            }
         }
     }
 
@@ -210,13 +278,26 @@ async fn run_scheduler(
                     return;
                 }
                 let st = *proc.state.lock();
-                if matches!(st, ProcState::Exited | ProcState::Crashed | ProcState::Killed) {
+                if st.is_terminal() {
                     if matches!(st, ProcState::Crashed | ProcState::Killed) {
                         eprintln!("procpane: turbo prebuild failed; aborting run");
                         if let Some(tx) = daemon.stop_tx.lock().as_ref() {
                             let _ = tx.send(true);
                         }
                         return;
+                    }
+                    // Synthetic non-persistent nodes for prebuild-handled tasks:
+                    // mark their procs Completed so downstream gates clear.
+                    for idx in graph.graph.node_indices() {
+                        if !persistent_set.contains(&idx) {
+                            let id = graph.graph[idx].id();
+                            if let Some(p) = daemon.procs.get(&id) {
+                                let mut st = p.state.lock();
+                                if matches!(*st, ProcState::Pending) {
+                                    *st = ProcState::Completed;
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -233,18 +314,38 @@ async fn run_scheduler(
             return;
         }
 
-        // Find nodes whose deps are all completed and which haven't been spawned.
+        // Find nodes whose deps are all satisfied (per-edge condition).
         let mut to_spawn: Vec<NodeIndex> = Vec::new();
         for idx in graph.graph.node_indices() {
             if spawned.contains(&idx) {
                 continue;
             }
+            let node = &graph.graph[idx];
             let mut ready = true;
             for dep in graph
                 .graph
                 .neighbors_directed(idx, petgraph::Direction::Incoming)
             {
-                if !completed.contains(&dep) {
+                let dep_id = graph.graph[dep].id();
+                // Look up per-task override from the dependent's overlay, by both
+                // canonical id and short id (overlay map keys can use either).
+                let cond = node
+                    .overlay
+                    .depends_on
+                    .get(&dep_id)
+                    .or_else(|| {
+                        // Strip "@scope/" prefix on the dep package, if any.
+                        graph.graph[dep]
+                            .package
+                            .split_once('/')
+                            .and_then(|(_, tail)| {
+                                let short_id = format!("{}#{}", tail, graph.graph[dep].task);
+                                node.overlay.depends_on.get(&short_id)
+                            })
+                    })
+                    .copied()
+                    .unwrap_or_else(|| default_condition(dep));
+                if !edge_satisfied(dep, cond) {
                     ready = false;
                     break;
                 }
@@ -265,9 +366,8 @@ async fn run_scheduler(
             let shell_cmd = match &node.script {
                 Some(s) => s.clone(),
                 None => {
-                    *proc.state.lock() = ProcState::Exited;
+                    *proc.state.lock() = ProcState::Completed;
                     spawned.insert(*idx);
-                    completed.insert(*idx);
                     continue;
                 }
             };
@@ -300,47 +400,70 @@ async fn run_scheduler(
             if let Err(e) = proc.spawn(&shell_cmd, &cwd, &env) {
                 tracing::error!(?e, "failed to spawn {id}");
                 *proc.state.lock() = ProcState::Crashed;
-                completed.insert(*idx);
-            }
-            spawned.insert(*idx);
-        }
-
-        // Check for newly-completed non-persistent procs.
-        for idx in graph.graph.node_indices() {
-            if completed.contains(&idx) {
+                spawned.insert(*idx);
                 continue;
             }
-            let id = graph.graph[idx].id();
-            if let Some(proc) = daemon.procs.get(&id) {
-                let st = *proc.state.lock();
-                if matches!(st, ProcState::Exited | ProcState::Crashed | ProcState::Killed) {
-                    completed.insert(idx);
-                }
-            }
+            spawned.insert(*idx);
+
+            // Kick off the healthcheck loop for this task.
+            let hc_cfg = node.overlay.healthcheck.clone();
+            let hostname = node.overlay.hostname.clone();
+            let buffer = match daemon.buffers.get(&id) {
+                Some(b) => b.clone(),
+                None => continue,
+            };
+            let kind = match &hc_cfg {
+                Some(hc) => match HealthcheckKind::from_sidecar(hc, hostname.as_deref()) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(task = %id, error = ?e, "invalid healthcheck; treating as none");
+                        HealthcheckKind::None
+                    }
+                },
+                None => HealthcheckKind::None,
+            };
+            let interval = hc_cfg.as_ref().map(|h| h.interval()).unwrap_or(Duration::from_secs(1));
+            let probe_t = hc_cfg.as_ref().map(|h| h.timeout()).unwrap_or(Duration::from_secs(2));
+            let start_p = hc_cfg.as_ref().map(|h| h.start_period()).unwrap_or(Duration::ZERO);
+            let proc_for_hc = Arc::clone(&proc);
+            let hc_stop = health_stop_rx.clone();
+            tokio::spawn(async move {
+                run_healthcheck_loop(
+                    proc_for_hc,
+                    buffer,
+                    kind,
+                    interval,
+                    probe_t,
+                    start_p,
+                    hc_stop,
+                )
+                .await;
+            });
         }
 
-        // Exit condition: every non-persistent task is complete and no persistent tasks remain alive.
+        // Exit condition: every non-persistent task has reached terminal state
+        // AND no persistent task is alive (either all terminal, or none was
+        // requested).
         let mut any_persistent_alive = false;
         let mut all_non_persistent_done = true;
         for idx in graph.graph.node_indices() {
             let node = &graph.graph[idx];
             let id = node.id();
-            let proc = daemon.procs.get(&id);
-            let state = proc.map(|p| *p.state.lock()).unwrap_or(ProcState::Pending);
+            let state = daemon
+                .procs
+                .get(&id)
+                .map(|p| *p.state.lock())
+                .unwrap_or(ProcState::Pending);
             if node.def.persistent {
-                if matches!(state, ProcState::Running | ProcState::Pending) {
+                if !state.is_terminal() {
                     any_persistent_alive = true;
                 }
-            } else if !matches!(
-                state,
-                ProcState::Exited | ProcState::Crashed | ProcState::Killed
-            ) {
+            } else if !state.is_terminal() {
                 all_non_persistent_done = false;
             }
         }
 
         if all_non_persistent_done && !any_persistent_alive {
-            // Nothing else will happen; trigger daemon shutdown.
             if let Some(tx) = daemon.stop_tx.lock().as_ref() {
                 let _ = tx.send(true);
             }
@@ -383,24 +506,21 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
             Response::Ok
         }
         Request::Status => {
-            let now = Instant::now();
-            let mut procs = Vec::new();
-            for (id, p) in &daemon.procs {
-                let started = *p.started_at.lock();
-                let age = started.map(|t| now.duration_since(t).as_secs()).unwrap_or(0);
-                let line_count = p.buffer.lock().line_count();
-                procs.push(ProcStatus {
-                    name: id.clone(),
-                    state: p.state.lock().as_str().to_string(),
-                    pid: *p.pid.lock(),
-                    age_secs: age,
-                    line_count,
-                    exit_code: *p.exit_code.lock(),
-                    persistent: p.persistent,
-                });
-            }
+            let procs = daemon
+                .procs
+                .iter()
+                .map(|(id, p)| build_proc_status(daemon, id, p))
+                .collect();
             Response::Status { procs }
         }
+        Request::GetTask { name } => match daemon.procs.get(&name) {
+            Some(p) => Response::Task {
+                task: build_proc_status(daemon, &name, p),
+            },
+            None => Response::Error {
+                message: format!("unknown task: {name}"),
+            },
+        },
         Request::Tail { name, lines } => match daemon.buffers.get(&name) {
             Some(buf) => {
                 let recs: Vec<LineRecord> = buf.lock().tail(lines);
@@ -461,4 +581,21 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
 
 pub fn state_dir(root: &Path) -> PathBuf {
     root.join(".procpane")
+}
+
+fn build_proc_status(daemon: &Daemon, id: &str, p: &Proc) -> ProcStatus {
+    let now = Instant::now();
+    let started = *p.started_at.lock();
+    let age = started.map(|t| now.duration_since(t).as_secs()).unwrap_or(0);
+    let line_count = p.buffer.lock().line_count();
+    ProcStatus {
+        name: id.to_string(),
+        state: p.state.lock().as_str().to_string(),
+        pid: *p.pid.lock(),
+        age_secs: age,
+        line_count,
+        exit_code: *p.exit_code.lock(),
+        persistent: p.persistent,
+        hostname: daemon.hostnames.get(id).cloned(),
+    }
 }

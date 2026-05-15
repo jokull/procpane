@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::TurboJson;
+use crate::sidecar::Sidecar;
 
 #[derive(Debug, Clone)]
 pub struct Package {
@@ -23,6 +24,7 @@ pub struct Package {
 pub struct Workspace {
     pub root: PathBuf,
     pub turbo: TurboJson,
+    pub sidecar: Sidecar,
     pub packages: Vec<Package>,
     /// Detected package manager command: "pnpm" | "npm" | "yarn" | "bun"
     pub pkg_manager: String,
@@ -76,6 +78,7 @@ impl Workspace {
             return Err(anyhow!("no turbo.json found at {}", turbo_path.display()));
         }
         let turbo = TurboJson::load(&turbo_path)?;
+        let sidecar = Sidecar::load(&root)?;
 
         let patterns = discover_workspace_patterns(&root)?;
         let pkg_manager = detect_package_manager(&root);
@@ -127,6 +130,7 @@ impl Workspace {
         Ok(Self {
             root,
             turbo,
+            sidecar,
             packages,
             pkg_manager,
         })

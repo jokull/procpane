@@ -13,8 +13,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Launch tasks in the background and return immediately
-    Run {
+    /// Launch tasks in the background and return immediately.
+    ///
+    /// Alias: `run` (kept for backward compatibility).
+    #[command(alias = "run")]
+    Up {
         /// Task names (`dev`) or qualified ids (`web#dev`). One or more.
         #[arg(required = true)]
         tasks: Vec<String>,
@@ -24,6 +27,14 @@ pub enum Cmd {
         /// Skip the `turbo run` prebuild step for non-persistent deps
         #[arg(long)]
         no_prebuild: bool,
+    },
+    /// Block until a task becomes healthy (or fails). Exit 0 = healthy, 1 = failed, 2 = timeout.
+    WaitFor {
+        /// Task id (e.g. `api#dev` or `@demo/api#dev`).
+        name: String,
+        /// Max time to wait. Examples: `30s`, `2m`.
+        #[arg(long, default_value = "5m")]
+        timeout: String,
     },
     /// List running processes
     Status {
@@ -49,7 +60,7 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Internal: daemon entry point (invoked by `run`).
+    /// Internal: daemon entry point (invoked by `up`).
     #[command(hide = true)]
     DaemonInner {
         tasks: Vec<String>,

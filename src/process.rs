@@ -10,10 +10,18 @@ use crate::buffer::SharedBuffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcState {
+    /// Waiting on dependencies; not yet spawned.
     Pending,
-    Running,
-    Exited,
+    /// Spawned, process running, healthcheck not yet satisfied.
+    /// (For tasks with no healthcheck, transitions to `Healthy` immediately.)
+    Starting,
+    /// Process running and healthcheck has passed (persistent tasks).
+    Healthy,
+    /// One-shot task ran to completion successfully (exit 0).
+    Completed,
+    /// Process exited with non-zero status, unexpectedly.
     Crashed,
+    /// Killed by us (SIGINT/SIGTERM/SIGKILL).
     Killed,
 }
 
@@ -21,11 +29,19 @@ impl ProcState {
     pub fn as_str(&self) -> &'static str {
         match self {
             ProcState::Pending => "pending",
-            ProcState::Running => "running",
-            ProcState::Exited => "exited",
+            ProcState::Starting => "starting",
+            ProcState::Healthy => "healthy",
+            ProcState::Completed => "completed",
             ProcState::Crashed => "crashed",
             ProcState::Killed => "killed",
         }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ProcState::Completed | ProcState::Crashed | ProcState::Killed
+        )
     }
 }
 
@@ -93,7 +109,7 @@ impl Proc {
         let killer = child.clone_killer();
 
         *self.pid.lock() = pid;
-        *self.state.lock() = ProcState::Running;
+        *self.state.lock() = ProcState::Starting;
         *self.started_at.lock() = Some(Instant::now());
         *self.killer.lock() = Some(killer);
         // Store child + master BEFORE spawning the reader thread to avoid a
@@ -129,7 +145,7 @@ impl Proc {
                     let mut st = proc_clone.state.lock();
                     if *st != ProcState::Killed {
                         *st = if code == 0 {
-                            ProcState::Exited
+                            ProcState::Completed
                         } else {
                             ProcState::Crashed
                         };
@@ -143,19 +159,19 @@ impl Proc {
         Ok(())
     }
 
-    pub fn stop(&self, grace: Duration) {
+    pub fn stop_with_signal(&self, signal: i32, grace: Duration) {
         {
             let mut st = self.state.lock();
-            if matches!(*st, ProcState::Exited | ProcState::Crashed | ProcState::Killed) {
+            if st.is_terminal() {
                 return;
             }
             *st = ProcState::Killed;
         }
         let pid = *self.pid.lock();
         if let Some(pid) = pid {
-            // SIGINT to the process group.
+            // Send to the process group so descendants get reaped.
             unsafe {
-                libc::kill(-pid, libc::SIGINT);
+                libc::kill(-pid, signal);
             }
         }
         let deadline = Instant::now() + grace;

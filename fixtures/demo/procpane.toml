@@ -1,0 +1,9 @@
+# procpane.toml — sidecar for the demo fixture.
+
+[tasks."@demo/api#dev"]
+healthcheck.log = "listening on"
+healthcheck.start_period = "500ms"
+
+[tasks."@demo/web#dev"]
+healthcheck.log = "ready in"
+healthcheck.start_period = "500ms"

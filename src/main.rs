@@ -4,9 +4,11 @@ mod client;
 mod config;
 mod daemon;
 mod graph;
+mod healthcheck;
 mod lock;
 mod process;
 mod proto;
+mod sidecar;
 mod workspace;
 
 use anyhow::{anyhow, Context, Result};
@@ -35,11 +37,12 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
 
     match args.cmd {
-        Cmd::Run {
+        Cmd::Up {
             tasks,
             foreground,
             no_prebuild,
         } => run_cmd(start, tasks, foreground, no_prebuild),
+        Cmd::WaitFor { name, timeout } => wait_for_cmd(start, name, timeout),
         Cmd::Status { json } => status_cmd(start, json),
         Cmd::Stop => stop_cmd(start),
         Cmd::Proc { name, op } => proc_cmd(start, name, op),
@@ -151,17 +154,18 @@ fn status_cmd(start: PathBuf, json: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&procs)?);
             } else {
                 println!(
-                    "{:<32} {:<10} {:>8} {:>6} {:>10}",
-                    "NAME", "STATE", "PID", "AGE", "LINES"
+                    "{:<32} {:<10} {:>8} {:>6} {:>10}  {}",
+                    "NAME", "STATE", "PID", "AGE", "LINES", "HOSTNAME"
                 );
                 for p in procs {
                     println!(
-                        "{:<32} {:<10} {:>8} {:>5}s {:>10}",
+                        "{:<32} {:<10} {:>8} {:>5}s {:>10}  {}",
                         p.name,
                         p.state,
                         p.pid.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
                         p.age_secs,
-                        p.line_count
+                        p.line_count,
+                        p.hostname.unwrap_or_default(),
                     );
                 }
             }
@@ -170,6 +174,70 @@ fn status_cmd(start: PathBuf, json: bool) -> Result<()> {
         _ => return Err(anyhow!("unexpected response")),
     }
     Ok(())
+}
+
+fn wait_for_cmd(start: PathBuf, name: String, timeout: String) -> Result<()> {
+    let dur = humantime::parse_duration(&timeout)
+        .map_err(|e| anyhow!("invalid --timeout: {e}"))?;
+    let root = resolve_root(start)?;
+    let socket = daemon::state_dir(&root).join("sock");
+    if !socket.exists() {
+        return Err(anyhow!("no procpane daemon running here"));
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let deadline = std::time::Instant::now() + dur;
+    let interval = Duration::from_millis(250);
+    let exit_code: i32 = rt.block_on(async {
+        loop {
+            let resp = match cli_client::call(
+                &socket,
+                Request::GetTask { name: name.clone() },
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("wait-for: {e}");
+                    return 1;
+                }
+            };
+            let task = match resp {
+                Response::Task { task } => task,
+                Response::Error { message } => {
+                    eprintln!("wait-for: {message}");
+                    return 1;
+                }
+                _ => {
+                    eprintln!("wait-for: unexpected response");
+                    return 1;
+                }
+            };
+            match task.state.as_str() {
+                "healthy" | "completed" => {
+                    println!("{name} is {}", task.state);
+                    return 0;
+                }
+                "crashed" | "killed" => {
+                    eprintln!(
+                        "wait-for: {name} reached terminal state {} (exit {:?})",
+                        task.state, task.exit_code
+                    );
+                    return 1;
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("wait-for: timeout after {timeout} (last state: {})", task.state);
+                return 2;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        std::process::exit(exit_code);
+    }
 }
 
 fn stop_cmd(start: PathBuf) -> Result<()> {

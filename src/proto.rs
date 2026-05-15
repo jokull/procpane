@@ -14,6 +14,9 @@ pub enum Request {
     },
     Since { name: String, cursor: u64 },
     Ping,
+    /// Block-style query: returns immediately with current state of the task.
+    /// The CLI side polls until state == "healthy" or terminal failure.
+    GetTask { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,18 +27,23 @@ pub enum Response {
     Status { procs: Vec<ProcStatus> },
     Lines { lines: Vec<LineRecord>, next_cursor: u64 },
     GrepMatches { matches: Vec<GrepMatch> },
+    Task { task: ProcStatus },
     Error { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcStatus {
     pub name: String,
-    pub state: String, // pending | running | exited | crashed | killed
+    /// pending | starting | healthy | completed | crashed | killed
+    pub state: String,
     pub pid: Option<i32>,
     pub age_secs: u64,
     pub line_count: u64,
     pub exit_code: Option<i32>,
     pub persistent: bool,
+    /// Hostname mapped via reverse proxy, when configured.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
