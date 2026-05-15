@@ -121,15 +121,89 @@ fn run_cmd(start: PathBuf, tasks: Vec<String>, foreground: bool, no_prebuild: bo
     let child = cmd.spawn().context("spawn daemon")?;
     let _ = child;
 
-    // Wait for socket.
+    // Wait for socket, then poll until every task reaches a stable state
+    // (healthy / completed / terminal) or we hit a budget. Show the README
+    // table on the way through.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
         cli_client::wait_for_socket(&socket_path, Duration::from_secs(10)).await
     })?;
-    println!("procpane started ({})", socket_path.display());
+    rt.block_on(async {
+        wait_and_print_status(&socket_path, Duration::from_secs(30)).await;
+    });
     Ok(())
+}
+
+async fn wait_and_print_status(socket: &std::path::Path, budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    let mut last_render: Option<String> = None;
+    loop {
+        let resp = match cli_client::call(socket, Request::Status).await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let procs = match resp {
+            Response::Status { procs } => procs,
+            _ => break,
+        };
+        let stable = procs.iter().all(|p| {
+            matches!(
+                p.state.as_str(),
+                "healthy" | "completed" | "crashed" | "killed"
+            )
+        });
+        let rendered = render_up_table(&procs);
+        if last_render.as_deref() != Some(rendered.as_str()) {
+            // Erase prior frame.
+            if let Some(prior) = &last_render {
+                let lines = prior.matches('\n').count();
+                for _ in 0..lines {
+                    eprint!("\x1b[1A\x1b[2K");
+                }
+            }
+            eprint!("{rendered}");
+            last_render = Some(rendered);
+        }
+        if stable {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn render_up_table(procs: &[proto::ProcStatus]) -> String {
+    let mut out = String::new();
+    let mut healthy = 0usize;
+    for p in procs {
+        let mark = match p.state.as_str() {
+            "healthy" | "completed" => {
+                healthy += 1;
+                "✓"
+            }
+            "crashed" | "killed" => "✗",
+            _ => "⏳",
+        };
+        let host = p.hostname.as_deref().unwrap_or("");
+        let host_disp = if host.is_empty() {
+            String::new()
+        } else {
+            format!("  https://{host}")
+        };
+        out.push_str(&format!(
+            "{mark} {name:<28} {state:<10}{host}\n",
+            name = p.name,
+            state = p.state,
+            host = host_disp
+        ));
+    }
+    let alive = procs.iter().filter(|p| !matches!(p.state.as_str(), "killed" | "crashed")).count();
+    out.push_str(&format!("{healthy}/{alive} tasks healthy.\n"));
+    out
 }
 
 fn daemon_inner(root: PathBuf, tasks: Vec<String>, no_prebuild: bool) -> Result<()> {
