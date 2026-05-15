@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::BTreeMap;
 
-use crate::config::{parse_dep, DepRef, TaskDef};
+use crate::config::{parse_dep, DepRef, TaskDef, TurboJson};
 use crate::workspace::Workspace;
 
 #[derive(Debug, Clone)]
@@ -71,13 +71,22 @@ impl TaskGraph {
                 .package(&pkg)
                 .ok_or_else(|| anyhow!("unknown package: {pkg}"))?;
             let short_id = format!("{}#{}", package.short, task);
-            // Resolve task def: prefer pkg#task entry (canonical or short), fall back to bare task name.
-            let def = ws
+            // Resolve task def. Lookup order:
+            //   1. Package-local turbo.json (if any): explicit `pkg#task` / `short#task` / bare `task`.
+            //   2. Root turbo.json: same fallback chain.
+            // Per-package entries fully override the root entry for that task name
+            // (matches turbo's `extends: ["//"]` semantics — task-level override, not deep merge).
+            let lookup = |t: &TurboJson| -> Option<TaskDef> {
+                t.task(&id)
+                    .or_else(|| t.task(&short_id))
+                    .or_else(|| t.task(&task))
+                    .cloned()
+            };
+            let def = package
                 .turbo
-                .task(&id)
-                .or_else(|| ws.turbo.task(&short_id))
-                .or_else(|| ws.turbo.task(&task))
-                .cloned()
+                .as_ref()
+                .and_then(lookup)
+                .or_else(|| lookup(&ws.turbo))
                 .unwrap_or_default();
             let script = package.scripts.get(&task).cloned();
 

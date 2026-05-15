@@ -14,6 +14,9 @@ pub struct Package {
     pub path: PathBuf,
     pub scripts: BTreeMap<String, String>,
     pub deps: Vec<String>,
+    /// Per-package `turbo.json` (sibling to `package.json`). Overrides root for
+    /// task entries that exist here; absent entries fall through to the root.
+    pub turbo: Option<TurboJson>,
 }
 
 #[derive(Debug)]
@@ -225,11 +228,18 @@ fn read_package(dir: &Path) -> Result<Package> {
     {
         deps.push(d.clone());
     }
+    let turbo_path = dir.join("turbo.json");
+    let turbo = if turbo_path.is_file() {
+        Some(TurboJson::load(&turbo_path)?)
+    } else {
+        None
+    };
     Ok(Package {
         name,
         short,
         path: dir.to_path_buf(),
         scripts: pj.scripts,
         deps,
+        turbo,
     })
 }
