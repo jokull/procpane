@@ -204,6 +204,9 @@ fn render_up_table(procs: &[proto::ProcStatus]) -> String {
             state = p.state,
             host = host_disp
         ));
+        for note in &p.notes {
+            out.push_str(&format!("    ↳ {note}\n"));
+        }
     }
     let alive = procs.iter().filter(|p| !matches!(p.state.as_str(), "killed" | "crashed")).count();
     out.push_str(&format!("{healthy}/{alive} tasks healthy.\n"));

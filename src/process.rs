@@ -8,6 +8,33 @@ use std::time::{Duration, Instant};
 
 use crate::buffer::SharedBuffer;
 
+/// Env vars carried over from procpane's parent shell even when the task has
+/// opted into `env_from` (and therefore wants a scrubbed env). These are the
+/// vars a Unix process generally expects to find — locale, terminal, user
+/// identity, temp directory. *No* third-party-credentials-shaped names.
+const SAFE_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_TIME",
+    "LC_NUMERIC",
+    "LC_MONETARY",
+    "TZ",
+    "TMPDIR",
+    "COLORTERM",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "PAGER",
+    "EDITOR",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcState {
     /// Waiting on dependencies; not yet spawned.
@@ -76,7 +103,21 @@ impl Proc {
 
     /// Spawn under a PTY, in its own process group. Returns once the child is
     /// spawned; reader thread streams into the ring buffer.
-    pub fn spawn(self: &Arc<Self>, shell_cmd: &str, cwd: &Path, env: &[(String, String)]) -> Result<()> {
+    ///
+    /// `inherit_parent_env` controls whether the spawned process sees procpane's
+    /// full parent environment. When `false`, only a minimal "safe" set
+    /// (HOME, USER, LANG, etc.) is inherited and everything else is dropped —
+    /// the caller's overlay (`env`) is the only source of project-specific
+    /// values. This is the right mode for tasks that have declared an
+    /// `env_from` allowlist; it makes the allowlist actually load-bearing
+    /// instead of "allowlist on top of full bleed".
+    pub fn spawn(
+        self: &Arc<Self>,
+        shell_cmd: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        inherit_parent_env: bool,
+    ) -> Result<()> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -93,9 +134,21 @@ impl Proc {
         cmd.arg(shell_cmd);
         cmd.cwd(cwd);
 
-        // Inherit env, then overlay.
-        for (k, v) in std::env::vars() {
-            cmd.env(k, v);
+        if inherit_parent_env {
+            for (k, v) in std::env::vars() {
+                cmd.env(k, v);
+            }
+        } else {
+            // Wipe the auto-inherited parent env first, then only add the
+            // minimal "safe" set. Without env_clear(), portable-pty merges
+            // our additions on top of the full parent env — so the allowlist
+            // would be a no-op.
+            cmd.env_clear();
+            for k in SAFE_ENV_KEYS {
+                if let Ok(v) = std::env::var(k) {
+                    cmd.env(k, v);
+                }
+            }
         }
         // Tell programs we are a terminal.
         cmd.env("TERM", "xterm-256color");

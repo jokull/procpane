@@ -44,6 +44,10 @@ pub struct ProcStatus {
     /// Hostname mapped via reverse proxy, when configured.
     #[serde(default)]
     pub hostname: Option<String>,
+    /// One-line diagnostic hints surfaced by the daemon (e.g. "wrangler
+    /// detected → CLOUDFLARE_INCLUDE_PROCESS_ENV=true").
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

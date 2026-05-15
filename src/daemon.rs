@@ -35,6 +35,9 @@ pub struct Daemon {
     pub stop_signals: BTreeMap<String, i32>,
     /// Per-task grace period before SIGKILL. Default 5s.
     pub stop_grace: BTreeMap<String, Duration>,
+    /// Per-task one-line diagnostic notes (e.g. "wrangler detected → ..."),
+    /// rendered as indented sub-lines under the task in the up-table.
+    pub notes: BTreeMap<String, Mutex<Vec<String>>>,
 }
 
 impl Daemon {
@@ -131,6 +134,7 @@ impl Daemon {
         let mut hostnames: BTreeMap<String, String> = BTreeMap::new();
         let mut stop_signals: BTreeMap<String, i32> = BTreeMap::new();
         let mut stop_grace: BTreeMap<String, Duration> = BTreeMap::new();
+        let mut notes: BTreeMap<String, Mutex<Vec<String>>> = BTreeMap::new();
         // Pre-allocate a port per hostnamed task. Tasks read PORT from env at
         // spawn time; proxy routes by SNI.
         let mut allocated_ports: BTreeMap<String, u16> = BTreeMap::new();
@@ -143,7 +147,8 @@ impl Daemon {
                 allocated_ports.insert(id.clone(), port);
             }
             stop_signals.insert(id.clone(), n.overlay.stop_signal());
-            stop_grace.insert(id, n.overlay.stop_grace());
+            stop_grace.insert(id.clone(), n.overlay.stop_grace());
+            notes.insert(id, Mutex::new(Vec::new()));
         }
 
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -158,6 +163,7 @@ impl Daemon {
             allocated_ports: allocated_ports.clone(),
             stop_signals,
             stop_grace,
+            notes,
         });
 
         // Start the TLS reverse proxy if any task declared a hostname AND the
@@ -351,7 +357,9 @@ async fn run_scheduler(
                 shell.push_str(id);
             }
             let env: Vec<(String, String)> = Vec::new();
-            if let Err(e) = proc.spawn(&shell, &root, &env) {
+            // Prebuild is just `turbo run …` — inherit full env so user's
+            // turbo cache token / npm registry config / etc. all work.
+            if let Err(e) = proc.spawn(&shell, &root, &env, true) {
                 tracing::error!(?e, "prebuild spawn failed");
                 *proc.state.lock() = ProcState::Crashed;
                 if let Some(tx) = daemon.stop_tx.lock().as_ref() {
@@ -536,12 +544,30 @@ async fn run_scheduler(
             // touching `.dev.vars`. Detect `wrangler` as a standalone command
             // token in the script (handles `wrangler dev`, `npx wrangler`,
             // `pnpm exec wrangler`, `bun x wrangler`, etc.).
-            if is_wrangler_invocation(&shell_cmd) {
+            let wrangler = is_wrangler_invocation(&shell_cmd);
+            if wrangler {
                 env.push(("CLOUDFLARE_INCLUDE_PROCESS_ENV".into(), "true".into()));
             }
 
+            // If the task declared env_from, treat that as opting into a tight
+            // allowlist: spawn with a scrubbed env so the parent shell's other
+            // exports don't bleed in (and, transitively, don't bleed into the
+            // Worker when CLOUDFLARE_INCLUDE_PROCESS_ENV is on).
+            let scrubbed = !node.overlay.env_from.is_empty();
+
+            // Record a one-line note for the up-table when we auto-flip the
+            // Wrangler flag — the user opted into env_from, and we're telling
+            // them their allowlist now covers the Worker's `env` too.
+            if wrangler && scrubbed {
+                if let Some(slot) = daemon.notes.get(&id) {
+                    slot.lock().push(
+                        "wrangler detected → CLOUDFLARE_INCLUDE_PROCESS_ENV=true; env_from is the allowlist".into(),
+                    );
+                }
+            }
+
             let cwd = node.cwd.clone();
-            if let Err(e) = proc.spawn(&shell_cmd, &cwd, &env) {
+            if let Err(e) = proc.spawn(&shell_cmd, &cwd, &env, !scrubbed) {
                 tracing::error!(?e, "failed to spawn {id}");
                 *proc.state.lock() = ProcState::Crashed;
                 spawned.insert(*idx);
@@ -762,6 +788,11 @@ fn build_proc_status(daemon: &Daemon, id: &str, p: &Proc) -> ProcStatus {
     let started = *p.started_at.lock();
     let age = started.map(|t| now.duration_since(t).as_secs()).unwrap_or(0);
     let line_count = p.buffer.lock().line_count();
+    let notes = daemon
+        .notes
+        .get(id)
+        .map(|m| m.lock().clone())
+        .unwrap_or_default();
     ProcStatus {
         name: id.to_string(),
         state: p.state.lock().as_str().to_string(),
@@ -771,5 +802,6 @@ fn build_proc_status(daemon: &Daemon, id: &str, p: &Proc) -> ProcStatus {
         exit_code: *p.exit_code.lock(),
         persistent: p.persistent,
         hostname: daemon.hostnames.get(id).cloned(),
+        notes,
     }
 }
