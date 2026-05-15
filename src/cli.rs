@@ -115,6 +115,15 @@ pub enum EnvOp {
     },
     /// Remove a stored secret.
     Unset { key: String },
+    /// Allocate a wormhole code and wait for a teammate to send secrets.
+    Receive,
+    /// Send selected secrets to a teammate who is waiting with a code.
+    Send {
+        /// The code printed by `procpane env receive` (e.g. "12-circus-domino").
+        code: String,
+        /// Keys to send. Default: every stored key.
+        keys: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -11,6 +11,7 @@ mod process;
 mod proto;
 mod proxy;
 mod secrets;
+mod share;
 mod sidecar;
 mod workspace;
 
@@ -496,6 +497,22 @@ fn env_cmd(start: PathBuf, op: EnvOp) -> Result<()> {
                 println!("(no such key: {key})");
             }
             Ok(())
+        }
+        EnvOp::Receive => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(share::receive(&service))
+        }
+        EnvOp::Send { code, keys } => {
+            let keys = if keys.is_empty() {
+                secrets::list_accounts(&service)?
+            } else {
+                for k in &keys {
+                    validate_key(k)?;
+                }
+                keys
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(share::send(&service, code, keys))
         }
     }
 }
