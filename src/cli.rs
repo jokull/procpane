@@ -50,6 +50,11 @@ pub enum Cmd {
         #[command(subcommand)]
         op: ProcOp,
     },
+    /// Manage repo-scoped secrets stored in the macOS Keychain.
+    Env {
+        #[command(subcommand)]
+        op: EnvOp,
+    },
     /// Cross-task grep
     Grep {
         pattern: String,
@@ -69,6 +74,27 @@ pub enum Cmd {
         #[arg(long)]
         no_prebuild: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EnvOp {
+    /// Set a secret value (prompts if --value not given).
+    Set {
+        key: String,
+        /// Provide value inline (not recommended; leaks into shell history).
+        #[arg(long)]
+        value: Option<String>,
+    },
+    /// Print a secret value to stdout.
+    Get { key: String },
+    /// List secret keys stored for this repo. Values never shown.
+    List {
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a stored secret.
+    Unset { key: String },
 }
 
 #[derive(Subcommand, Debug)]

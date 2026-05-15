@@ -13,6 +13,7 @@ use crate::graph::TaskGraph;
 use crate::healthcheck::{run_healthcheck_loop, HealthcheckKind};
 use crate::process::{Proc, ProcState};
 use crate::proto::{GrepMatch, LineRecord, ProcStatus, Request, Response};
+use crate::secrets;
 use crate::sidecar::DependsOnCondition;
 use crate::workspace::Workspace;
 
@@ -48,6 +49,41 @@ impl Daemon {
         let graph = TaskGraph::build(&ws, &requested)?;
         if graph.graph.node_count() == 0 {
             return Err(anyhow!("no tasks resolved"));
+        }
+
+        // Pre-flight: every secret in env_from must be present in Keychain.
+        let service = secrets::service_name(&ws.root);
+        let mut missing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for idx in graph.graph.node_indices() {
+            let n = &graph.graph[idx];
+            if !n.def.persistent {
+                continue;
+            }
+            for key in &n.overlay.env_from {
+                match secrets::get(&service, key) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => missing.entry(n.id()).or_default().push(key.clone()),
+                    Err(e) => {
+                        return Err(anyhow!("keychain check failed for {}: {e}", n.id()));
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let mut all_keys: Vec<String> = missing
+                .values()
+                .flat_map(|v| v.iter().cloned())
+                .collect();
+            all_keys.sort();
+            all_keys.dedup();
+            eprintln!(
+                "✗ Missing {} required env vars: {}",
+                all_keys.len(),
+                all_keys.join(", ")
+            );
+            eprintln!("  Set them with:  procpane env set <KEY>");
+            eprintln!("  Or receive from a teammate:  procpane env receive <code>");
+            return Err(anyhow!("missing required secrets"));
         }
 
         // Partition graph nodes: persistent (procpane runs) vs non-persistent (turbo prebuild).
@@ -395,7 +431,20 @@ async fn run_scheduler(
                 }
                 path.push_str(&cur_path);
             }
-            let env: Vec<(String, String)> = vec![("PATH".into(), path)];
+            let mut env: Vec<(String, String)> = vec![("PATH".into(), path)];
+
+            // Inject env_from secrets from Keychain. Pre-flight verified
+            // presence; if a value disappeared between then and now we warn
+            // and let the task start without it (rare race).
+            let service = secrets::service_name(&root);
+            for key in &node.overlay.env_from {
+                match secrets::get(&service, key) {
+                    Ok(Some(val)) => env.push((key.clone(), val)),
+                    Ok(None) => tracing::warn!(task = %id, key, "env_from secret vanished after pre-flight"),
+                    Err(e) => tracing::warn!(task = %id, key, error = ?e, "env_from fetch failed"),
+                }
+            }
+
             let cwd = node.cwd.clone();
             if let Err(e) = proc.spawn(&shell_cmd, &cwd, &env) {
                 tracing::error!(?e, "failed to spawn {id}");

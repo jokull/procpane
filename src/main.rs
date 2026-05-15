@@ -8,6 +8,7 @@ mod healthcheck;
 mod lock;
 mod process;
 mod proto;
+mod secrets;
 mod sidecar;
 mod workspace;
 
@@ -16,7 +17,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cli::{Cli, Cmd, ProcOp};
+use crate::cli::{Cli, Cmd, EnvOp, ProcOp};
 use crate::client as cli_client;
 use crate::proto::{Request, Response};
 use crate::workspace::Workspace;
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
         Cmd::Status { json } => status_cmd(start, json),
         Cmd::Stop => stop_cmd(start),
         Cmd::Proc { name, op } => proc_cmd(start, name, op),
+        Cmd::Env { op } => env_cmd(start, op),
         Cmd::Grep {
             pattern,
             after,
@@ -303,6 +305,77 @@ fn proc_cmd(start: PathBuf, name: String, op: ProcOp) -> Result<()> {
             print_grep(resp, json)
         }
     }
+}
+
+fn env_cmd(start: PathBuf, op: EnvOp) -> Result<()> {
+    let root = resolve_root(start)?;
+    let service = secrets::service_name(&root);
+    match op {
+        EnvOp::Set { key, value } => {
+            validate_key(&key)?;
+            let v = match value {
+                Some(v) => v,
+                None => rpassword::prompt_password(format!("Value for {key}: "))
+                    .map_err(|e| anyhow!("prompt failed: {e}"))?,
+            };
+            if v.is_empty() {
+                return Err(anyhow!("empty value; not storing"));
+            }
+            secrets::set(&service, &key, &v)?;
+            println!("✓ stored {key}");
+            Ok(())
+        }
+        EnvOp::Get { key } => {
+            validate_key(&key)?;
+            match secrets::get(&service, &key)? {
+                Some(v) => {
+                    print!("{v}");
+                    Ok(())
+                }
+                None => Err(anyhow!("{key} not set")),
+            }
+        }
+        EnvOp::List { json } => {
+            let keys = secrets::list_accounts(&service)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&keys)?);
+            } else if keys.is_empty() {
+                println!("(no secrets stored for this repo)");
+            } else {
+                for k in keys {
+                    println!("{k}");
+                }
+            }
+            Ok(())
+        }
+        EnvOp::Unset { key } => {
+            validate_key(&key)?;
+            if secrets::delete(&service, &key)? {
+                println!("✓ removed {key}");
+            } else {
+                println!("(no such key: {key})");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(anyhow!("empty key"));
+    }
+    // Env-var-shaped: ASCII alnum + underscore, not starting with digit.
+    let ok = key.chars().enumerate().all(|(i, c)| {
+        c == '_'
+            || c.is_ascii_alphabetic()
+            || (i > 0 && c.is_ascii_digit())
+    });
+    if !ok {
+        return Err(anyhow!(
+            "key must match [A-Za-z_][A-Za-z0-9_]* (got: {key})"
+        ));
+    }
+    Ok(())
 }
 
 fn grep_cmd(start: PathBuf, pattern: String, before: usize, after: usize, json: bool) -> Result<()> {
