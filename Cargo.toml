@@ -33,6 +33,12 @@ ctrlc = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rpassword = "7"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+dirs = "5"
+time = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

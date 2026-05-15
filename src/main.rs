@@ -1,4 +1,5 @@
 mod buffer;
+mod ca;
 mod cli;
 mod client;
 mod config;
@@ -8,6 +9,7 @@ mod healthcheck;
 mod lock;
 mod process;
 mod proto;
+mod proxy;
 mod secrets;
 mod sidecar;
 mod workspace;
@@ -17,7 +19,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::cli::{Cli, Cmd, EnvOp, ProcOp};
+use crate::cli::{Cli, Cmd, EnvOp, ProcOp, TrustOp};
 use crate::client as cli_client;
 use crate::proto::{Request, Response};
 use crate::workspace::Workspace;
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
         Cmd::Stop => stop_cmd(start),
         Cmd::Proc { name, op } => proc_cmd(start, name, op),
         Cmd::Env { op } => env_cmd(start, op),
+        Cmd::Trust { op } => trust_cmd(op),
         Cmd::Grep {
             pattern,
             after,
@@ -377,6 +380,69 @@ fn proc_cmd(start: PathBuf, name: String, op: ProcOp) -> Result<()> {
                 },
             ))?;
             print_grep(resp, json)
+        }
+    }
+}
+
+fn trust_cmd(op: TrustOp) -> Result<()> {
+    match op {
+        TrustOp::Install { pretty_urls } => {
+            ca::ensure_ca()?;
+            let cert_path = ca::ca_cert_path()?;
+            println!("Installing CA into /Library/Keychains/System.keychain");
+            println!("  cert: {}", cert_path.display());
+            println!("  This will prompt for `sudo` (Touch ID works if pam_tid is enabled).");
+            let status = std::process::Command::new("sudo")
+                .arg("security")
+                .arg("add-trusted-cert")
+                .arg("-d") // user trust → root trust (with -k System.keychain)
+                .arg("-r")
+                .arg("trustRoot")
+                .arg("-k")
+                .arg("/Library/Keychains/System.keychain")
+                .arg(&cert_path)
+                .status()
+                .map_err(|e| anyhow!("failed to invoke `sudo security`: {e}"))?;
+            if !status.success() {
+                return Err(anyhow!("`security add-trusted-cert` failed"));
+            }
+            println!("✓ CA installed. https://*.test:8443 is now trusted.");
+            if pretty_urls {
+                println!("\n--pretty-urls: pf-based :443→:8443 redirect is not yet implemented.");
+                println!("For now, use https://web.test:8443 (note the explicit port).");
+            }
+            Ok(())
+        }
+        TrustOp::Uninstall => {
+            let cert_path = ca::ca_cert_path()?;
+            if cert_path.is_file() {
+                let status = std::process::Command::new("sudo")
+                    .arg("security")
+                    .arg("delete-certificate")
+                    .arg("-c")
+                    .arg(ca::CA_COMMON_NAME)
+                    .arg("-t")
+                    .arg("/Library/Keychains/System.keychain")
+                    .status();
+                match status {
+                    Ok(s) if s.success() => println!("✓ removed from System keychain"),
+                    Ok(_) => eprintln!("(no entry in System keychain, or sudo declined)"),
+                    Err(e) => eprintln!("sudo invocation failed: {e}"),
+                }
+            }
+            if let Ok(dir) = ca::ca_dir() {
+                let _ = std::fs::remove_dir_all(&dir);
+                println!("✓ removed {}", dir.display());
+            }
+            Ok(())
+        }
+        TrustOp::Status => {
+            if ca::is_installed() {
+                println!("✓ CA files present: {}", ca::ca_dir()?.display());
+            } else {
+                println!("✗ CA not generated. Run `procpane trust install` first.");
+            }
+            Ok(())
         }
     }
 }

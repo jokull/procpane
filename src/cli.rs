@@ -55,6 +55,11 @@ pub enum Cmd {
         #[command(subcommand)]
         op: EnvOp,
     },
+    /// Manage the local Certificate Authority for `https://*.test` URLs.
+    Trust {
+        #[command(subcommand)]
+        op: TrustOp,
+    },
     /// Cross-task grep
     Grep {
         pattern: String,
@@ -74,6 +79,21 @@ pub enum Cmd {
         #[arg(long)]
         no_prebuild: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TrustOp {
+    /// Generate the local CA (if missing) and install it into the System keychain.
+    /// Prompts for `sudo` (Touch ID works if pam_tid is enabled).
+    Install {
+        /// Also configure a pf redirect from :443 → :8443 for *.test. Optional.
+        #[arg(long)]
+        pretty_urls: bool,
+    },
+    /// Remove the local CA from the System keychain and delete its files.
+    Uninstall,
+    /// Show CA status (installed? trusted? expires when?).
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

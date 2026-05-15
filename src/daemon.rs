@@ -13,9 +13,10 @@ use crate::graph::TaskGraph;
 use crate::healthcheck::{run_healthcheck_loop, HealthcheckKind};
 use crate::process::{Proc, ProcState};
 use crate::proto::{GrepMatch, LineRecord, ProcStatus, Request, Response};
+use crate::proxy::{self, PortRegistry, PROXY_PORT};
 use crate::secrets;
 use crate::sidecar::DependsOnCondition;
-use crate::workspace::Workspace;
+use crate::{ca, workspace::Workspace};
 
 pub const PREBUILD_ID: &str = "procpane#prebuild";
 
@@ -28,6 +29,8 @@ pub struct Daemon {
     pub started_at: Instant,
     /// Per-task hostname declared in `procpane.toml` (for status output).
     pub hostnames: BTreeMap<String, String>,
+    /// Per-task allocated TCP port (when hostname is set; PORT env injected).
+    pub allocated_ports: BTreeMap<String, u16>,
     /// Per-task shutdown signal (libc::SIG*). Default SIGINT.
     pub stop_signals: BTreeMap<String, i32>,
     /// Per-task grace period before SIGKILL. Default 5s.
@@ -128,11 +131,16 @@ impl Daemon {
         let mut hostnames: BTreeMap<String, String> = BTreeMap::new();
         let mut stop_signals: BTreeMap<String, i32> = BTreeMap::new();
         let mut stop_grace: BTreeMap<String, Duration> = BTreeMap::new();
+        // Pre-allocate a port per hostnamed task. Tasks read PORT from env at
+        // spawn time; proxy routes by SNI.
+        let mut allocated_ports: BTreeMap<String, u16> = BTreeMap::new();
         for idx in &persistent_indices {
             let n = &graph.graph[*idx];
             let id = n.id();
             if let Some(h) = &n.overlay.hostname {
                 hostnames.insert(id.clone(), h.clone());
+                let port = proxy::allocate_port()?;
+                allocated_ports.insert(id.clone(), port);
             }
             stop_signals.insert(id.clone(), n.overlay.stop_signal());
             stop_grace.insert(id, n.overlay.stop_grace());
@@ -146,10 +154,52 @@ impl Daemon {
             buffers: buffers.clone(),
             stop_tx: Arc::new(Mutex::new(Some(stop_tx.clone()))),
             started_at: Instant::now(),
-            hostnames,
+            hostnames: hostnames.clone(),
+            allocated_ports: allocated_ports.clone(),
             stop_signals,
             stop_grace,
         });
+
+        // Start the TLS reverse proxy if any task declared a hostname AND the
+        // local CA is installed. Without the CA, warn but keep going (the user
+        // may want to inspect status / logs without HTTPS).
+        let port_registry = PortRegistry::new();
+        if !hostnames.is_empty() {
+            if ca::is_installed() {
+                let host_list: Vec<String> = hostnames.values().cloned().collect();
+                match proxy::build_tls_config(&host_list) {
+                    Ok(tls_cfg) => {
+                        let bind: std::net::SocketAddr =
+                            ([127, 0, 0, 1], PROXY_PORT).into();
+                        let reg = Arc::clone(&port_registry);
+                        let mut prx_stop = stop_rx.clone();
+                        // Pre-register hostnames → allocated backend ports so
+                        // the proxy can route even before tasks turn healthy
+                        // (returns 503 until backend accepts).
+                        for (id, host) in &hostnames {
+                            if let Some(p) = allocated_ports.get(id) {
+                                reg.register(host, *p);
+                            }
+                        }
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy::run_proxy(tls_cfg, reg, bind, prx_stop.clone()).await {
+                                tracing::error!(?e, "reverse proxy stopped");
+                            }
+                            let _ = prx_stop.changed().await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("procpane: skipping HTTPS proxy ({e})");
+                    }
+                }
+            } else {
+                eprintln!(
+                    "procpane: tasks declare hostnames but the local CA is not installed."
+                );
+                eprintln!("  Run `procpane trust install` to enable https://*.test URLs.");
+            }
+        }
+        let _ = port_registry; // silence unused if no hostnames
 
         // Install signal handler so Ctrl-C or SIGTERM triggers shutdown.
         {
@@ -432,6 +482,42 @@ async fn run_scheduler(
                 path.push_str(&cur_path);
             }
             let mut env: Vec<(String, String)> = vec![("PATH".into(), path)];
+
+            // If this task has a hostname, hand it the allocated port via PORT
+            // and a public URL via the canonical-cased hostname env var.
+            if let Some(host) = daemon.hostnames.get(&id) {
+                if let Some(port) = daemon.allocated_ports.get(&id) {
+                    env.push(("PORT".into(), port.to_string()));
+                    env.push((
+                        "PROCPANE_PUBLIC_URL".into(),
+                        format!("https://{host}:{}", PROXY_PORT),
+                    ));
+                }
+            }
+            // Inject every *other* task's public URL too, so apps that talk to
+            // siblings can resolve without hard-coding ports.
+            for (other_id, other_host) in &daemon.hostnames {
+                if other_id == &id {
+                    continue;
+                }
+                // Build an env var name from the short task name:
+                //   "@demo/api#dev" → API_URL
+                //   "api#dev"       → API_URL
+                let pkg_short = other_id
+                    .split_once('#')
+                    .map(|(p, _)| p)
+                    .unwrap_or(other_id)
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(other_id)
+                    .to_uppercase()
+                    .replace(['-', '.'], "_");
+                let var_name = format!("{pkg_short}_URL");
+                env.push((
+                    var_name,
+                    format!("https://{other_host}:{}", PROXY_PORT),
+                ));
+            }
 
             // Inject env_from secrets from Keychain. Pre-flight verified
             // presence; if a value disappeared between then and now we warn
