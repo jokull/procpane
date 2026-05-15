@@ -531,6 +531,15 @@ async fn run_scheduler(
                 }
             }
 
+            // Wrangler doesn't read parent process env by default; opt in so
+            // env_from secrets reach the Worker's `env` binding without ever
+            // touching `.dev.vars`. Detect `wrangler` as a standalone command
+            // token in the script (handles `wrangler dev`, `npx wrangler`,
+            // `pnpm exec wrangler`, `bun x wrangler`, etc.).
+            if is_wrangler_invocation(&shell_cmd) {
+                env.push(("CLOUDFLARE_INCLUDE_PROCESS_ENV".into(), "true".into()));
+            }
+
             let cwd = node.cwd.clone();
             if let Err(e) = proc.spawn(&shell_cmd, &cwd, &env) {
                 tracing::error!(?e, "failed to spawn {id}");
@@ -716,6 +725,36 @@ fn dispatch(daemon: &Daemon, req: Request) -> Response {
 
 pub fn state_dir(root: &Path) -> PathBuf {
     root.join(".procpane")
+}
+
+/// Returns true if the shell command runs `wrangler` as a command (not as a
+/// substring of some other word). Tokenize on whitespace and shell separators.
+fn is_wrangler_invocation(shell_cmd: &str) -> bool {
+    shell_cmd
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')'))
+        .any(|tok| tok == "wrangler" || tok.ends_with("/wrangler"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_wrangler_invocation;
+
+    #[test]
+    fn detects_wrangler() {
+        assert!(is_wrangler_invocation("wrangler dev"));
+        assert!(is_wrangler_invocation("npx wrangler dev"));
+        assert!(is_wrangler_invocation("pnpm exec wrangler dev"));
+        assert!(is_wrangler_invocation("bun x wrangler"));
+        assert!(is_wrangler_invocation("./node_modules/.bin/wrangler dev"));
+        assert!(is_wrangler_invocation("cd worker && wrangler dev"));
+    }
+
+    #[test]
+    fn ignores_lookalikes() {
+        assert!(!is_wrangler_invocation("vite"));
+        assert!(!is_wrangler_invocation("./wrangler-cleanup.sh"));
+        assert!(!is_wrangler_invocation("echo 'wrangler is great'")); // string literal
+    }
 }
 
 fn build_proc_status(daemon: &Daemon, id: &str, p: &Proc) -> ProcStatus {
